@@ -1,0 +1,34 @@
+# Cloned reference repos (analysis only, not part of project)
+reference/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python (for future MVP impl)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Node (for future MVP impl)
+node_modules/
+*.log
+.env
+.env.local
+
+# Local cache
+.cache/
+*.cache
