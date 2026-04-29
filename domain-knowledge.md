@@ -353,6 +353,98 @@ DeerFlow 的实际做法(以中间件为主):
 | 配置版本化 | `config_version: 8` 字段 + `make config-upgrade` 自动迁移 |
 | 类型严格 | 全栈 Pydantic + Python 3.12 type hints + ruff 240 字符 |
 
+### 2.11 Adapter 真价值在跨源中间层,不在 per-source 代码 [2026-04-29]
+
+**触发观察**:跑完 22 adapter 实测后,用户问 "我看你调用都很简单,那对于这种 adapter 是不是可以完全 skills 化?" ——观察是对的,值得正面打。
+
+**这一节是 §2.5(MCP vs Skills 的 token 经济)和 §2.9(adapter vs skill 边界)的合并修正**——前两节给的是"何时用 skill / 何时用 adapter",本节解决"adapter 这层到底是什么"。
+
+#### 2.11.1 实测结论:per-source 调用平均 = 10 行 bash
+
+22 source 全测下来,每个 source 的核心调用是同一种结构:
+
+```bash
+xh GET <URL> <params> <auth-header> | jq '<filter>'
+```
+
+差异 = URL 模板 + 1-2 个 header + jq 选字段。**这部分写 Python 类纯属过度工程**——和用户洞察一致。
+
+#### 2.11.2 但 adapter 不为单 source 存在,为这 7 个跨源中间层服务存在
+
+| 功能 | 单条 bash | 多 bash 拼接 | core 代码 |
+|---|---|---|---|
+| 多 source 并发 fan-out + per-source 超时 | ❌ | `xargs -P` + 子进程错误捕获,可写但脆 | trivial (`asyncio.gather`) |
+| **RRF 融合**(GitHub stars + arXiv citations + HN points 合并) | ❌ | 让 LLM 每次重写算法,token + 错率双高 | ~30 行 |
+| URL 去重 / canonical 化(同仓在 GH+DeepWiki+libraries.io 出现 3 次) | ❌ | 重复劳动 | ~20 行 |
+| **schema 归一**(`stargazers_count` ↔ `points` ↔ `citationCount` → 统一 `ranking_score`) | ❌ | 重复劳动,字段名易漂 | per-source 字段映射 |
+| **cache + cache_key 派生**(同 query 5 min 内返同结果) | ❌ | 文件缓存可写在 skill 里,但状态管理脆 | ~50 行(参考 DeerFlow `_stable_tool_key()` §2.10.2) |
+| 错误 → ErrorResult(host 看到 explicit error 不脑补) | ❌ | 每条 bash 错误让 LLM 解析,代价高 | trivial |
+| Rate-limit 保护(S2 burst 即 429,GH 60→5000)| ❌ | 状态全靠 LLM 记,几乎必崩 | per-source 配额 + retry |
+
+→ 这 7 件事是 search harness 的**真正价值**——不是"per-source 代码",是"**所有 source 共享的中间层**"。
+
+#### 2.11.3 三档架构(按 LoC 砍)
+
+**档 1 — adapter-heavy**(原 architecture.md 的隐含假设):
+- 19 个 adapter Python 类 × 各 100-200 LoC + core ~500 LoC = **~3-5K LoC 总**
+- 优:per-source 单测、quirk 编入代码、host 完全无脑
+- 缺:重;source 漂移按月算,跟不上节奏
+
+**档 2 — config-driven engine**(推荐):
+- 1 个 generic `SearchEngine` core(fan-out / RRF / cache / errors / schema 校验)
+- + 19 个 YAML config,每文件 ~10-30 行
+- 总 **~1-2K LoC**,per-source 工作量 ~10 分钟
+- 加新 source = 1 个 config,**0 代码**
+
+YAML 例(GitHub):
+```yaml
+name: github
+url_template: "https://api.github.com/search/repositories?q={query}&sort=stars"
+headers:
+  Authorization: "Bearer ${GITHUB_TOKEN}"
+  Accept: "application/vnd.github+json"
+field_map:
+  title:         ".items[].full_name"
+  url:           ".items[].html_url"
+  ranking_score: ".items[].stargazers_count"
+  snippet:       ".items[].description"
+  source:        "github"
+quirks:
+  require_token: true     # adapter 启动时检测 PAT 缺失则跳过
+  rate_limit:    "30/min search; 5000/hr core"
+```
+
+**90% quirks 可表达为 config**(加 header / param / 二段 fetch 模式),**剩 10% 重 quirks**(GitLab N+1 license / CRAN cranlogs 配对 / arXiv Atom XML 解析)写成 core 里的 **named hooks**,config 通过 `hook: <name>` 引用。
+
+**档 3 — pure skill**(无 CLI binary):
+- 0 个 adapter,0 个 CLI
+- 5-7 个 skill 教 host 直接 bash
+- 跨源 fan-out → host 自己开并发 + 自己 RRF + 自己 dedup
+
+#### 2.11.4 档 3 的致命缺陷:token 经济**反向**
+
+§2.5 引用 Anthropic *Code execution with MCP* 的 98% token reduction——**前提是 "让 LLM 调一个本地命令做完所有 fan-out + 过滤"**。pure-skill 把这个反过来打:
+
+| 场景 | 档 2(config engine) | 档 3(pure skill) |
+|---|---|---|
+| `find-repo` 4 source 并发 | host 调 1 个 CLI,**返回 ~2KB top-10 候选** | host 跑 4 bash,**4 × ~30KB raw JSON 进 context** ≈ 30K+ tokens |
+| RRF 融合 | core 几毫秒做完 | host 在 LLM context 里写算法,**token + 错率双高** |
+| 重复 query | core cache 命中,~0ms | host 每次重跑 |
+
+**关键认识**:CLI binary 不是"对抗 MCP",是"**对抗让 LLM 直接消费 raw API 响应**"。两件事。pure-skill 把这个分界拆穿了——它把所有 fan-out + 解析推回 LLM context,**让 §2.5 的 token 优势反向**。这是档 3 的死因,不是工程口味。
+
+#### 2.11.5 对 §2.9 决策树的修正
+
+§2.9 决策树问 "需不需要 adapter"——给的是 source-level 答案("有特殊 ranking 信号 → adapter")。**本节修正了 adapter 的定义本身**:
+
+| 维度 | 旧定义(隐含) | 新定义 |
+|---|---|---|
+| Adapter 是什么 | 每个 source 一份 Python 代码 | source 在 generic engine 里的一份 config |
+| 加新 source 的成本 | 100-200 LoC + 单测 | 10-30 行 YAML |
+| 共享中间层在哪 | core(隐式)+ 19 个 adapter 重复实现 | core(显式)|
+
+→ §2.9 的 source-级决议(22 个进 Tier 1)不变,**实施形态**从"22 个 Python 类"降级为"22 个 source config + 1 个共享 engine"。
+
 ---
 
 ## 3. 关键论文 / 文献(可直接 cite)
@@ -462,9 +554,50 @@ DeerFlow 的实际做法(以中间件为主):
 8. **DeepWiki 等 AI 二级源直接白嫖**——别自己跑别人已经做过的 LLM 处理
 9. **多模态分 5 Tier,buff 思路**——长尾价值不能用 ROI 均摊算
 10. **开源,不闭源**——见 §4.3
-11. **Adapter vs Skill 严格分边界**——adapter 只在 web_search 替代不了 ranking/字段时才写;只是"agent 不知道有这站"的问题用 skill 的 cross-reference 段解决。**结果**:Tier 1 收敛到 12 个核心 adapter,数十个 site 转 skill-only,见 [adapter-vs-skill.md](./adapter-vs-skill.md)
+11. **Adapter vs Skill 严格分边界**——adapter 只在 web_search 替代不了 ranking/字段时才写;只是"agent 不知道有这站"的问题用 skill 的 cross-reference 段解决。**结果**:Tier 1 收敛到 **22 个核心 adapter**([2026-04-26] 把可选 adapter 全部纳入到 23,**[2026-04-29] 实测后 Papers with Code 因域名死被 drop**),数十个 site 转 skill-only,见 [`adapter-vs-skill.md`](./adapter-vs-skill.md) + [`adapter-empirical-test-report.md`](./adapter-empirical-test-report.md)
 12. **三源吸收工程纪律**——DeerFlow 提供工程骨架(provider 抽象、reflection、boundary、lazy init、Pydantic 全栈、trace_id),gstack/superpowers 提供 skill 写作纪律(命令式语气、verifiable 步骤、reject slop 文化),gbrain 提供 "fat skills" prompt 强度。**三者综合,而非单一参考**(见 §1.8 + architecture.md §11)
 13. **防偷懒主要靠 skill prompt**——DeerFlow 实证:防过度行动靠 LoopDetection 中间件,**防"做得不够"主要靠 skill 文件里的 imperative prompt**。研究质量分水岭在 skill 文本如何写,不是代码逻辑(见 §2.10.2)
+14. **GitHub 检索能力实测结论 [2026-04-26]**——同一道 repo-discovery 题(`Rust full-text search engine library`)并行打了 GitHub API / Sourcegraph 匿名 / grep.app / searchcode.com / DeepWiki MCP,再做 SG 免费匿名层 vs GH+PAT 5 任务 head-to-head 对比。建设性结论:
+    - **不存在"GitHub 检索 SOTA"产品**——能力按 4 档(词法 / 语义 / 符号 / 仓 Q&A)分散在不同栈,任一单引擎都漏头部答案。**meilisearch(50k+ stars)在 GH 和 SG 关键词搜索都没进 top 10**,因为它描述写"search API"不是"library";纯词法 AND 匹配从底层够不到措辞差异——这是任何"基于 description"的引擎的通病
+    - **GitHub PAT 从"推荐升级"升为实质必需**——匿名 code search 直接 401,architecture.md §3.2 / §7 的措辞要相应改
+    - **Sourcegraph 免费匿名层只剩 3 个 niche 价值**(进 skill imperative,不进 adapter):
+      - `type:symbol` 跨仓符号搜索(带 kind/containerName/行号,GH 无对应原语)
+      - `type:commit` / `type:diff` + `after:` `before:` `author:`(GH gh CLI 也能但语法分裂)
+      - `repo:has.file(path:X content:Y) select:repo` 反查依赖(独家)
+    - **SG 工程坑**:杀手锏 structural search 在免费层 shard timeout 静默失败(实测 60s 0 结果),误以为可用反而踩坑;`repo:has.meta(stars)` 是 enterprise-only;GraphQL anon 硬封顶 30 必须用 stream API(`/.api/search/stream`);**要主动检查 `progress.skipped[reason=shard-timeout]`**,否则会无声漏 torvalds/linux 这种大库;覆盖偏 GitHub,Codeberg/forgejo 不指望
+    - **grep.app + searchcode.com 双双对 agent 失效**——前者被 Vercel Turnstile 反爬墙隔离 plain HTTP 完全打不通,得 Playwright 解 challenge;后者 legacy API 已 404 下线,转付费 MCP。**两者从 sources.md §1.2 直接 drop**
+    - **DeepWiki 严格定位"orient,不 cite"**——LLM-on-RAG 不稳定是通病(生成温度 + 检索 tie-breaker + 缓存 TTL + index 增量重建 4 层叠加),不是 DeepWiki 单家做不好。精确 API 签名 / 行号 / license 必须回 GitHub raw API,不走任何生成式管道
+    - **真正的工程杠杆**(任何检索引擎都解决不了,只能在我们这层做):
+      - skill 层强制 query rewriting:`library` 这种缩窄词要扩成 `(library OR engine OR backend OR crate OR sdk)`——实测把 GH 命中从 41 砍到 3 的元凶就是这一个词
+      - skill 层强制 multi-source fusion + **社区 sentiment cross-ref**(HN/Reddit/掘金/Zenn 的 `site:`)——补"description-keyword 漏大鱼"的唯一便宜手段
+      - adapter 层把 `progress.skipped` 等 silent-failure 字段当一等公民,纳入 result-quality 信号
+    - **元教训**:**"SOTA" 是营销词,不是工程词**——这个领域产品迭代极快(grep.app 半年内被反爬墙、searchcode 转付费、SG 转 fair-source),凡判断"X 是 SOTA"必须实测,文档过期速度按月算
+    - **待落变更**:architecture.md §3.2 / §7 改 PAT 措辞;sources.md §1.2 drop grep.app + searchcode.com;adapter-vs-skill.md §5.1 把 SG 的 skill 教法从"模糊跨仓代码搜索"改成 3 条具体 niche imperative
+
+15. **22 adapter 实测全量验证 [2026-04-29]**——把 §5.1 #11 锁定的 23 个 ★ adapter 分 6 类目(Repo/Q&A/学术/主流PM/小众PM/特殊),并行 6 subagent 各自跑 instant + long-tail query 真接 API,产出 [`adapter-empirical-test-report.md`](./adapter-empirical-test-report.md)。建设性结论:
+    - **Papers with Code 已死** — 域名 302 全跳到 `huggingface.co/papers/trending`,`/api/v1/*` 全 404。Phase 1 23 → 22。这是 §5.1 #11 决议后第一次"必做 scope 缩减",也是文档**至少需要季度复测**的实证(产品死亡按月算)
+    - **`api.deps.dev`(Google Open Source Insights)浮现为隐藏主角** — pkg.go.dev `/api/v1/*` 全返 HTML 是死胡同,Go/Maven/PyPI 的 license + version metadata 真路径在 deps.dev。**Phase 1 后期或 Phase 2 考虑作为 cross-cut helper**(类似 libraries.io 角色,服务多 PM adapter 内部 fallback)。这是新发现的"白嫖大厂 metadata 后端"案例,符合 §8 元规则 #3
+    - **"无搜索 API" 三家**(PyPI / Maven / pkg.go.dev)长尾发现完全依赖 libraries.io。**libraries.io 不是"兜底"而是"结构性必需"**。同时 libraries.io 实测仍活着(数据 2026-03 新鲜),package-detail 端点匿名可用,`/search` 需 30s key — **混合 auth 双层** 现实要写进 adapter
+    - **GitHub PAT + S2 key 升为实质必需**(同 §5.1 #14 GitHub PAT 结论一致,S2 是新发现):S2 匿名 burst 即触发 429。零配置叙事不能装作没这层成本——architecture.md §3.2 / §7 已改
+    - **三家"零下载量"包管理器**(PyPI / Maven / CRAN)+ Conda `/search` 充斥镜像 spam(实测 `jjhelmus/_pytorch_select` 这种)— 这一组的长尾全部需要外部数据源(libraries.io / cranlogs / 频道白名单)。**没有原生 popularity 信号 = 长尾必须兜底**,不是可选
+    - **多实例 / 多站点 adapter 隐藏成本对称**:SE 一份代码 5 站(SO/DBA/SF/CR/AI.SE)= 正向规模效应;GitLab 多实例(.com / .gnome.org / .freedesktop.org)+ N+1 license 调用 = 负向规模成本。设计前要分清
+    - **匿名能用 vs 匿名跑得动**:13/22 adapter 完全匿名可用,但 GitHub / S2 / Reddit 三家"匿名跑得动但要立刻配 key"——零配置叙事要诚实,**不能装作 GitHub PAT 是 optional**
+    - **元教训**(同 §5.1 #14):"有 API 文档不等于有 API"—— pkg.go.dev `/api/v1/*` 是教科书反例(网页明文列着,实测全返 HTML)。**永远 curl 真接,别只读 docs**;adapter scope 文档**至少季度复测**
+
+16. **Adapter 真价值在跨源中间层,不在 per-source 代码 [2026-04-29]**——22 source 实测后用户提的尖锐问题:"我看你调用都很简单,那这种 adapter 是不是可以完全 skills 化?" 推动梳理三档架构(adapter-heavy / config-driven engine / pure skill)和 7 项跨源中间层职责(fan-out / RRF / dedup / schema 归一 / cache / error / rate-limit)。**结论框架** 见 §2.11。**核心认识**:
+    - per-source 调用的确简单(≈10 行 bash),为每个 source 写一份 Python 类是过度工程
+    - adapter 的真价值在 **7 项跨源中间层**——这部分必须 core 代码,不是 skill 能省的
+    - pure-skill 模式让 raw API JSON(每 source ~30KB)灌进 LLM context,**反向打 §2.5 的 token 经济** —— 死因不是工程口味,是数学
+    - 推荐**档 2 config-driven**:1 个 SearchEngine core + 19 个 YAML config,~1-2K LoC,加 source = 加 config 文件 + 0 代码
+    - **§2.9 的 source-级决议(22 个进 Tier 1)不变,实施形态从 "19 Python 类" 降级为 "19 YAML config"**
+    - **实施决定状态**:架构层认知已对齐,具体落 architecture.md §3.10 / §6.1 重写后 commit(待拍板)
+
+17. **Tier 4(find-talk)实施路径锁定到 invidious `/api/v1` [2026-04-30]**——读 GitHub trending 5 项目分析后,发现 invidious 报告里 §7 明示 `/api/v1` 是 "当前性价比最高的无密钥 YouTube API",FreeTube/LibreTube 已把它当事实标准依赖。建设性结论:
+    - **Tier 4 不是技术难,是"找对中间件"难** —— invidious + Companion 二元架构(主仓库 + Deno/TS 反爬 sidecar)已经在 fight YouTube 的反爬升级,2024-2025 期间 Piped / yt-dlp / NewPipe 都遭周期性"血洗",**自己写 youtube-transcript-fetcher 6 个月内必崩**
+    - **find-talk vertical 实施 = 三层 fallback**:Layer 1 公共 invidious 实例池(`docs.invidious.io/instances/`)+ multi-instance round-robin + 健康检查;Layer 2 用户 self-host invidious + companion(docker-compose 一行起);Layer 3 yt-dlp CLI 兜底
+    - **关键 endpoints**:`/api/v1/search?q=...&type=video`、`/api/v1/captions/<videoId>`(transcript)、`/api/v1/videos/<videoId>` —— 全部 anon、零 key、JSON
+    - **范畴**:不进 Phase 1 ★ 16 adapter scope(那是 Tier 1);**是 Tier 4 的实施 anchor**;启动时机仍可放 Phase 2,但实施门槛大幅下降
+    - **元洞察**:invidious + Companion 是 architecture.md §3.7 "co-install 而非 bundle" + §11.4 "single binary" 哲学的实证案例 —— 别人帮我们维护脏活,两层间接但每层都已稳定运营。这是"白嫖大厂中间件"原则的另一个支柱
 
 ### 5.2 我们一开始想错被纠正的(避免重蹈)
 
@@ -490,7 +623,7 @@ DeerFlow 的实际做法(以中间件为主):
 6. Citation schema 在不同 Tier 间如何统一最小公共集
 7. Tier 3 web search backend 默认选哪个
 8. ~~sources.md 用户筛选保留哪些~~ → **已通过 [adapter-vs-skill.md](./adapter-vs-skill.md) 解决**
-9. 可选 adapter(libraries.io / OpenReview / HF Hub / CVE 等)是否进 Phase 1
+9. ~~可选 adapter(libraries.io / OpenReview / HF Hub / CVE 等)是否进 Phase 1~~ → **[2026-04-26] 全部纳入**(23 adapter,见 §5.1 #11 + adapter-vs-skill.md §2)
 10. 是否需要 result memory(同 query 第二次触发不重复 fan-out)—— **gbrain 是天然候选**(见 §1.8)
 11. 中日社区站的 web_search 命中率到底如何(需要实测验证 skill-only 假设)
 
@@ -549,6 +682,17 @@ DeerFlow 的实际做法(以中间件为主):
 - [Tavily](https://tavily.com) | [Exa](https://exa.ai) | [Brave Search API](https://brave.com/search/api/)
 - [Serper](https://serper.dev) | [SerpAPI](https://serpapi.com) | [Linkup](https://linkup.so)
 - [Perplexity Sonar](https://docs.perplexity.ai/) | [Kagi API](https://help.kagi.com/kagi/api/search.html)
+
+### Cross-cut metadata backend
+- [api.deps.dev](https://api.deps.dev)(Google Open Source Insights)— Go / Maven / PyPI / npm / crates / NuGet / RubyGems 的 license + version + advisoryKeys 元数据统一来源。**pkg.go.dev `/api/v1/*` 名存实亡后浮现为真路径**(见 §5.1 #15)
+
+### 项目内实测产物
+- [`adapter-empirical-test-report.md`](./adapter-empirical-test-report.md) — 2026-04-29 22 adapter 全量实测报告(6 subagent 并行 + 实接 API + 判决矩阵)
+
+### Tier 4 反爬中间件(YouTube 等平台)
+- [Invidious](https://github.com/iv-org/invidious) | [`/api/v1` 文档](https://docs.invidious.io/api/) | [公共实例列表](https://docs.invidious.io/instances/)(Tier 4 find-talk vertical 实施 anchor,见 §5.1 #17)
+- [Invidious Companion](https://github.com/iv-org/invidious-companion)(Deno/TS,反爬 sidecar)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)(Tier 4 兜底,周期性遭 YouTube 血洗)
 
 ---
 
