@@ -32,3 +32,6 @@ node_modules/
 # Local cache
 .cache/
 *.cache
+
+# Claude Code harness local state
+.claude/
