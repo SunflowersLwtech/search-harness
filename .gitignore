@@ -1,5 +1,8 @@
-# Cloned reference repos (analysis only, not part of project)
+# reference/ — 项目动态(case_study / runs / scripts / tools / .env)
 reference/
+
+# upstream/ — 开源 OSS repo clone(deer-flow / gbrain / gstack / superpowers)
+upstream/
 
 # macOS
 .DS_Store
