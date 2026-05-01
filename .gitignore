@@ -33,5 +33,19 @@ node_modules/
 .cache/
 *.cache
 
-# Claude Code harness local state
-.claude/
+# Claude Code harness local state — 默认排除,但项目级 skills 要跟踪
+.claude/*
+!.claude/skills/
+
+# tools/ — 项目本地安装的第三方 CLI(grok-cli 等),保留 package.json/lock,
+# 排除生成物.
+tools/**/node_modules/
+tools/**/dist/
+tools/**/.bun/
+
+# runs/ — ad-hoc API call outputs.
+# 按需用 `git add -f` 锚定 milestone 调用作为实证证据,详见 runs/README.md.
+runs/**/*.json
+runs/**/*.txt
+runs/**/*.log
+runs/**/*.ndjson
