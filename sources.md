@@ -47,7 +47,6 @@ twitterapi.io free-tier QPS = 1 req / 5s,串行 + sleep 5s。
 | 主流库 docs grounding | Context7 CLI(§2) | `ctx7 docs <libId> <q>` | OAuth |
 | 任意静态 URL → markdown(RFC / mkdocs / sphinx / 静态 HTML) | **Jina Reader** | `curl https://r.jina.ai/<url>` | 无 key |
 | SPA / login wall / JS-heavy 站(Mintlify / GitBook 类) | **Firecrawl** | `POST https://api.firecrawl.dev/v1/scrape` body `{url, formats:["markdown"]}` | `Authorization: Bearer $FIRECRAWL_API_KEY` |
-| vendor 发 OpenAPI YAML/JSON | **openapi-to-skills** | `npx openapi-to-skills <yaml-url> -o .claude/skills/` | 无(本地) |
 
 ---
 
