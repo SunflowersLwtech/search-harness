@@ -921,6 +921,314 @@ Claude Code hooks(`PreToolUse` / `PostToolUse` / `Stop` / `SubagentStop` / `User
     - petstore + 一份 Stainless YAML 给的"19 ops + 1369 文件"印象偏差极大——那是**工具能力天花板,不是用户实际需求面命中率**;**命中率 = YAML 公开率 × 用例匹配度 × YAML 完备度**,三者乘起来本项目命中率近 0
     - 与 §5.1 #23 D"三层蒸馏工具栈非竞争而是分工"对照:**生态位独立 ≠ 本项目都需要**;一个 source 在 inventory 里站得住的标准是"本项目用户的 query 形态命中它",不是"它在抽象空间占一格"
 
+25. **Firecrawl vs Jina Reader 实测后纠偏:静态站 agent DIY 完全够,Firecrawl 真正独有的是 SPA / CF 墙 / 大规模 [2026-05-05]**——把两个 repo 拉到 `upstream/` 做源码层比对,用同一目标(`docs.deps.dev`)跑 `/map` + `/scrape` + `/crawl` + `r.jina.ai` + **DIY curl+grep**,产出 `/tmp/fc-vs-jina/{01..06}*` 工件。**首版结论被自己实测推翻一次,留作主要教训**。建设性结论:
+
+    **A. 源码层(Public API surface 决定能力上限)**
+    - **Jina Reader `src/api/crawler.ts`** 仅 3 个 `@Method` 全单 URL 入口(`getIndex` `GET /`、`crawlByPostingToIndex` `POST /`、`crawlByGetting` `GET\|POST /::url`)。**无 frontier / sitemap 解析 / job state / status 端点**。`cachedScrap()` 只是 fetch 层(curl/browser/CF rendering)。`s.jina.ai`(`searcher.ts` `SearcherHost`)是"SERP + 每结果调 Reader",仍是单 URL × N
+    - **Firecrawl `apps/api/src/controllers/v2/crawl.ts`** `crawlController` 把 `includePaths/excludePaths/maxDiscoveryDepth/limit/allowExternalLinks/sitemap` 定义为 zod schema,创建 crawl group + `StoredCrawl` + robots.txt + kickoff job。worker 抽链接 + `crawl-redis.ts` URL 5-轴归一去重(`index.html`/`www`/scheme/hash/query)+ 入队
+    - Jina README 写 "adaptive crawler / full website Colab" 是 notebook demo,**不是 public service endpoint**;vendor README 文案 ≠ API surface
+
+    **B. 三路径在同一目标实跑(2026-05-05,docs.deps.dev,7 URL,5 页 markdown 比较)**
+    | 路径 | URL 发现 | 单页抓取 | 全站(5 页) | 工程量 | 成本 |
+    |---|---|---|---|---|---|
+    | **Firecrawl** | `/v2/map` 8s 拿 7 URL | `/v2/scrape` 3.8s/59k chars | `/v2/crawl` limit=5 → 1 kickoff + status poll → **73s / 5 credits / 103k chars** | 6 行 bash | 0.5 美分/页量级 |
+    | **Jina Reader** | ❌ 无 endpoint —— `r.jina.ai/<root>` 仅露 3 个内链(缺 `/glossary` `/faq` `/api/v3`)| `r.jina.ai/<url>` 2.2s/47k chars | 不可独立完成 | 0 行(被堵在 step 1)| 0 |
+    | **Agent DIY**(curl + grep 一层递归 + Jina) | **`curl + grep -oE 'href' \| sed`** **3s** 拿 7 URL ✓ | `r.jina.ai/<url>` 2.2s | **3s + 5×2.2 ≈ 14s** | **~20 行 bash** | 0 |
+
+    关键观察:
+    - `docs.deps.dev` **没有 `sitemap.xml` / `sitemap_index.xml` / `.gz`**(全 404),`robots.txt` 也无 `Sitemap:` 声明 —— Firecrawl `/map` 拿到的 7 URL **走的是 root HTML `<a href>` 抽取 + 一层递归**(`/api/` 子页里挖出 `/api/v3` `/api/v3alpha`),agent 自己 `curl | grep | sed` 完全等价
+    - DIY 结果 vs `/map`:**逻辑等价**,差异仅在 trailing-slash 归一(Firecrawl 做了,DIY 没做,9 → 7 去重)
+    - 单页 markdown:Firecrawl 比 Jina 长 26%(59k vs 47k,保留更多 anchor / TOC / table 结构);Jina 快 1.7s/页
+
+    **C. 首版错误结论(留作教训)**
+    - 第一稿写 "全站 docs 索引 → only Firecrawl,Jina 结构上不可达,等于自己写半个 Firecrawl",**被用户一句"sitemap agent 自己也可以发现的吧 firecrawl 提供了什么"打脸,DIY 实测 3 秒等价复现**
+    - 失误点:把 "Jina 没有全站原语" 错放大成 "全站采集只能用 Firecrawl",忽略了 **agent + bash + Jina 才是真竞品**,而非 "光 Jina"
+    - 元教训(承袭 §2.11):**当一个工具看似 differentiated 时,先问"agent 自己 + 通用工具能不能做",再问"做不了的部分有多大"**——这是档 1(skill imperative)vs 档 3(full wrapper)边界的同一道闸
+
+    **D. Firecrawl 真正独有(agent DIY 做不了或不愿做)**
+    1. **SPA / JS 渲染**:静态站 curl 够用,SPA 站(Mintlify / GitBook)agent 要 Playwright + JS-aware link 抽取,工程量翻倍。**Firecrawl 内置浏览器池 + 实测 §5.1 #23 D Anthropic Mintlify 478KB 完整**
+    2. **Cloudflare / 反爬绕过**:hosted stealth + proxy 通道,DIY 这个要烧 proxy 服务费 + Playwright stealth 插件,**工程级**
+    3. **URL 5-轴归一**(`crawl-redis.ts`):`index.html` / `www` / scheme / hash / query 全归一,DIY 容易写漏(本次 9 条要去重到 7 条已经踩过)
+    4. **`includePaths/excludePaths/maxDiscoveryDepth/limit/allowExternalLinks` 参数化 frontier**:DIY 要 if/else 一堆
+    5. **Hosted job state + 分页 `next`**:跑 1000+ 页大站状态机 + 断点续传,百页内不必
+    6. **多页并发 + 重试 + 速率自动**:DIY 写也不难,但累
+
+    **E. 真实选型矩阵(对 search-agent 实际 vendor docs 用例)**
+
+    [2026-05-05 OpenAlex 单 case → Wave 2 16 vendor panel,见 `reference/batch/meta/REPORT.md` + `reference/batch/wave2-vendor-probe/REPORT-wave2.md`] **第一版"Mintlify 行" 命名错** —— Wave 2 16 vendor 实证 Mintlify host 仅 18%(3/16),但 `llms.txt` 87%(14/16)、`llms-full.txt` 56%(9/16)。**`llms.txt` 是 2025-2026 期间形成的社区事实标准([llmstxt.org](https://llmstxt.org)),非 Mintlify 专利**。Anthropic / Cohere / OpenAI / Mistral 都不是 Mintlify host 但 ship。
+
+    优先级矩阵(替代第一版,数字是 16 vendor panel 严格 verified 命中率):
+
+    | # | 路径 | 命中率 | 单调用 | 适用场景 |
+    |---|---|---|---|---|
+    | **1** | `curl <root>/llms-full.txt`(< 5MB) | **44%** 实用区间(9/16 ship 减去 Anthropic/Cloudflare 巨型 + Vercel 假阳) | 1×curl,1-3s | 中型 vendor 直接入 LLM context |
+    | **2** | `curl <root>/llms.txt` 索引 + 选择性 jina 单页 | **87%** | 1+N curl | **巨型 llms-full.txt 的切片入口**(Anthropic 58MB + Cloudflare 49MB) |
+    | 3 | `robots.txt` → `sitemap.xml` + jina 每页(2 worker + backoff) | **88%** | 1+N curl | 1-2 都 miss 时(Stripe/Vercel/GitHub-style) |
+    | 4 | root HTML 抽 `<a href>` 一层递归 + jina | 100%(任何静态可访问站) | 1+N curl | 3 也 miss(Groq:sitemap 在根域不在 docs root) |
+    | 5 | Firecrawl `/scrape` `/crawl` | 100% | 1 credit/页,99/100 页 panel | 1-4 都失败 + 真 JS-only / 反爬 / 大规模 |
+
+    **Firecrawl 的真实差异化场景缩到** ≤ 10% 用户用例(JS-only + 反爬 + 上述 4 路径都不行)。**§5.1 #25 第一版 "SPA = Firecrawl 独有" 进一步收紧**:Mintlify SPA 因 Next.js SSG pre-render,Path 1-2 全部覆盖;真正"Firecrawl 必须"是 client-only React/Vue + 无 LLM-aware 文件 + 无 sitemap 的极端站,该子集小到不值得为它在 sources.md 默认链路里加复杂度。
+
+    **额外:`llms-full.txt` 的两种实践流派**(实测下载 9 vendor):
+    - **per-page Source: marker 流派**:每段开头 `# Title\nSource: <URL>` 精确对齐 sitemap(OpenAlex/Mistral/Fireworks/Together/Exa/Firecrawl,~1-1.7MB 区间)
+    - **整文 markdown 流派**:无 Source 标记,纯 h1 拼接(Anthropic 58MB / Cloudflare 49MB / OpenAI 1.7MB / Cohere 3MB)。**巨型流派的实际意义**:**vendor 给开发者一个 single-file backup,自切片缓存复用** —— Firecrawl /crawl 跑 Anthropic 站不仅多余,而且漏掉 vendor 自己提供的 100× 大 superset
+
+    **`openapi.json` 真 JSON 命中率仅 6-13%(Wave 2 strict 验证)**:OpenAlex `/api-reference/openapi.json` 是甜区特例,**不能作为默认路径**。多数 Mintlify SPA 的 `/api-reference/openapi.json` 路由到 SPA shell HTML,假阳性 25%。要时单独 try `/openapi.{json,yaml,yml}`、`/api/openapi.json`、`/api-reference/openapi.json` 三路,**严格验 Content-Type = application/json**
+
+    **DIY 路径的真实工程成本(OpenAlex 整站实测补的细节)**:
+    - **Jina anon 6 并发立刻 429**:首轮 94 URL 只成功 20,降到 2 worker + exponential backoff 后 92/94,余 2 timeout 需手动重试。**单 IP free-tier 配额是 DIY 路径的隐藏税**(同 §5.1 #21 X 三方 free-tier 现象)
+    - **xh 处理大 JSON response 时疑似动 body**:`/v2/crawl` status 1.3MB 包含未转义 `\` 致 `json.loads` invalid escape;改 raw `curl` 同 URL 后 valid。**默认工具链是 curl,不是 httpie/xh**
+
+    **F. 对 sources.md §3 的修订**(Wave 2 后再次更新)
+    - §3 表保持 3 行(单页输入形态分类),不动
+    - Tip 区按 Wave 2 panel 数据重写为 5 级优先级,见 `sources.md` §3 实测命中率注脚
+    - §5.1 #24 demote openapi-to-skills 决议加固:Wave 2 strict 验证 `openapi.json` 真命中率 6-13%,远低于 §5.1 #24 测试主仓库 OpenAPI 公开率(31%/16),**docs 站层面比 GitHub 主仓库还低**
+
+    **H. 对 ground-api skill 的具体 imperative**(Wave 2 重写)
+    收到"vendor X docs 找 Y"请求时,**3s 内 4 个 curl 决定路径**(probe + 严格验证):
+    ```bash
+    # 1. llms-full.txt size 判
+    SIZE=$(curl -sI "$ROOT/llms-full.txt" | grep -i 'content-length' | awk '{print $2}' | tr -d '\r')
+    [ -n "$SIZE" ] && [ "$SIZE" -gt 500 ] && [ "$SIZE" -lt 5000000 ] && echo "PATH=1.1 中型直入" && exit 0
+
+    # 2. llms.txt 索引(可能巨型 llms-full.txt 的 chunk 入口)
+    curl -sI "$ROOT/llms.txt" | grep -q '200' && echo "PATH=1.2 索引导航" && exit 0
+
+    # 3. robots.txt → sitemap.xml(注意:不一定在 /docs/ 下)
+    curl -sSL "$ROOT/robots.txt" | grep -i '^Sitemap:'  # 找真路径
+
+    # 4. SPA 必有的: root HTML <a href>(Wave 1 deps.dev 模式)
+    # 5. 都失败 → Firecrawl
+    ```
+    Wave 2 16 vendor panel 实测路径分布:1.1=44%,1.2=13%,1.3=19%,1.4=6%,1.5=≤10%。**Firecrawl 落到≤10% 用例 ≠ "无差异化",而是 ≤10% 的 niche valuable**(client-only React/Vue + 无 LLM-aware + 无 sitemap 的极端站);搜索代理 ROI 上不值得做默认路径,但保留兜底
+
+    **I. Mintlify 是什么 + 5 条路径每条返回的具象形态**(从 Wave 1+2 工件实采,2026-05-05)
+
+    ### Mintlify
+
+    **是什么**:docs hosting SaaS,Next.js SSG/SSR 后端。客户:Anthropic、Cohere、Mistral、Together、Fireworks、Firecrawl 自己、OpenAlex 等(参 §5.1 #23 E Stainless 画像里的 SDK + docs 三层产业链)。
+    **行为特征**:
+    - 路由是 catch-all —— 任何未命中静态资源的 path 都返同一 SPA shell HTML(200 + `Content-Type: text/html`)。**这是 Wave 2 假阳性 25% 的根因**:probe `/api-reference/openapi.json` 返 200,但 body 是 SPA HTML,只有 `application/json` Content-Type 才是真 spec
+    - 默认 ship `/sitemap.xml` + `/llms.txt` + `/llms-full.txt` 三件套(社区 [llmstxt.org](https://llmstxt.org) 标准的事实化推手之一,但**不是发明者**)
+    - HTML 里有 SSG 预渲染文本(curl + 解析就能拿正文,不需 Playwright);bundle 含 `mintlify-assets/_next/static/chunks/` 标记
+    - 部分客户配 `/api-reference/openapi.json` 真 JSON(OpenAlex 是),多数路由到 SPA shell
+
+    ### Path 1:`/llms-full.txt`
+
+    **是什么**:全站 markdown 内容拼成单文件。
+    **Content-Type**:`text/plain` 或 `text/markdown`(Mintlify 默认前者)
+    **大小区间**:298B(假阳性 "Page Not Found")→ **1-3MB(实用甜区,7/16 vendor)** → 49-58MB(Cloudflare/Anthropic 巨型,故意 ship 全文)
+    **两种格式流派实采**:
+
+    **流派 A — per-page `Source:` marker**(OpenAlex / Mistral / Fireworks / Together / Exa / Firecrawl):
+    ```markdown
+    # Authentication & Pricing
+    Source: https://developers.openalex.org/api-reference/authentication
+
+    API keys, pricing tiers, and usage limits
+
+    OpenAlex data is and will remain available at no cost...
+
+    ## Getting an API Key
+    ...
+
+    # Authors
+    Source: https://developers.openalex.org/api-reference/authors
+    ...
+    ```
+    每段开头 `# Title\nSource: <URL>`,精确对齐 sitemap.xml。**用 `^Source: ` grep 即可拆页** —— OpenAlex 实测 `grep -c '^Source: '` = 94,与 sitemap URL 数完全匹配。这种格式 LLM 友好(每段头部告诉模型这段来自哪个 URL,citation 直接拿)
+
+    **流派 B — 整文 markdown(无 Source: marker)**(Anthropic / Cloudflare / OpenAI / Cohere):
+    ```markdown
+    # Anthropic Developer Documentation - Full Content
+
+    This file provides comprehensive documentation with full rendered content.
+
+    ## Root URL
+    Claude Developer Platform Console (Requires login)
+    https://platform.claude.com
+
+    ## Available Languages on Website
+    - English (en) - 1284 pages - ✓ Full content included below
+    - German (de) - 132 pages - Visit website for content
+    ...
+    ```
+    无 Source: 标记,纯 h1/h2/h3 拼接。Anthropic 的更进一步加了 meta 段(语言列表 / root URL)。**好处**:vendor 给开发者一个 single-file 全文 backup;**坏处**:agent 切片要自己按 h1/h2 推断 URL 边界,citation 不稳
+
+    ### Path 2:`/llms.txt`
+
+    **是什么**:LLM-aware 索引文件(简介 + 路径列表),[llmstxt.org](https://llmstxt.org) 标准。
+    **Content-Type**:`text/plain` / `text/markdown`
+    **大小**:典型 1-10KB
+    **格式**(OpenAlex 实采):
+    ```markdown
+    # OpenAlex API - LLM Reference
+
+    OpenAlex is an open catalog of the global research system with 270M+ works...
+
+    ## Quick Start
+    Base URL: https://api.openalex.org
+    Auth: api_key parameter (free at openalex.org/settings/api)
+    Rate limit: $1/day free usage with key, $0.01/day without
+
+    ## Entity Endpoints
+    GET /works - Scholarly documents (articles, books, datasets, theses)
+    GET /works/{id} - Single work by OpenAlex ID (W2741809807) or DOI
+    ...
+
+    ## CRITICAL: Always Resolve Names to IDs
+    WRONG: /works?filter=authorships.author.display_name:Einstein
+    RIGHT:
+      1. /authors?search=Einstein → get id "A5012345678"
+      2. /works?filter=authorships.author.id:A5012345678
+    ```
+    **关键观察**:不是单纯的 URL 列表,**有 vendor 自己写的"使用模式 + 反模式"导引**(看 OpenAlex 的 "CRITICAL: Always Resolve Names to IDs")。这是 sitemap.xml 没有的、**对 ground-api skill 极其有用的语义信息**。87% 命中率使其成为最稳的入口
+
+    ### Path 3:`/sitemap.xml`(robots.txt → Sitemap: 行)
+
+    **是什么**:SEO 标准 XML,纯 URL 列表。
+    **Content-Type**:`application/xml`
+    **大小**:1-100KB 典型
+    **格式**(OpenAlex 实采):
+    ```xml
+    <?xml version="1.0" encoding="UTF-8"?>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url>
+        <loc>https://developers.openalex.org/api-reference/authentication</loc>
+        <lastmod>2026-02-24T19:03:05.134Z</lastmod>
+      </url>
+      <url>
+        <loc>https://developers.openalex.org/api-reference/authors</loc>
+        <lastmod>2026-02-17T21:58:02.285Z</lastmod>
+      </url>
+      ...
+    </urlset>
+    ```
+    只有 URL + lastmod + 偶尔 changefreq/priority。**没有任何描述、内容**,要拿到正文必须**逐 URL 再 fetch**(走 `r.jina.ai/<url>` 或 curl + 解析)。Wave 2 教训:Groq 的 sitemap 在根域(`https://console.groq.com/sitemap.xml`)不在 `/docs/sitemap.xml`,**先读 `robots.txt`** 找 `Sitemap:` 真路径
+
+    ### Path 4:root HTML 抽 `<a href>` 一层递归
+
+    **是什么**:vendor docs 首页的 HTML body,内有所有内部 nav 链接。
+    **Content-Type**:`text/html`(SSG 站含正文,纯 SPA 站只有 shell)
+    **抽链方法**(OpenAlex 实采):
+    ```bash
+    curl -sSL https://developers.openalex.org/ \
+      | grep -oE 'href="[^"]+"' \
+      | grep -E '^href="(/|https://developers.openalex.org)' \
+      | sed 's/^href="//;s/"$//' \
+      | sort -u
+    ```
+    **返回**:
+    ```
+    /
+    /api-reference/authors
+    /api-reference/funders
+    /api-reference/institutions
+    /api-reference/introduction
+    /api-reference/publishers
+    /api-reference/sources
+    /api-reference/topics
+    /api-reference/works
+    /download/overview
+    ```
+    一层抽到 10 个一级链接,**每个再 curl 一次抽其 href** = 二层递归 = 完整 frontier(deps.dev 实测 2 层够,3 层多余)。**Mintlify SSG 站抽链命中率 100%**(因为 nav 的 `<a>` 是 pre-render 的,不依赖 JS 运行时)。客户端 React/Vue SPA 这一步会失败 —— 落到 Path 5
+
+    ### Path 5:Firecrawl
+
+    **`/v2/map` 返回**(OpenAlex 实采):
+    ```json
+    {
+      "success": true,
+      "links": [
+        {
+          "url": "https://developers.openalex.org/guides/key-concepts",
+          "title": "Key Concepts - OpenAlex Developers",
+          "description": "Understand entities, IDs, and data structures in OpenAlex"
+        },
+        {
+          "url": "https://developers.openalex.org/api-reference/works/list-works",
+          "title": "List works - OpenAlex Developers",
+          "description": "Get a list of scholarly works with optional filtering, searching, sorting, and pagination..."
+        },
+        ...
+      ]
+    }
+    ```
+    比 sitemap.xml 多 `title` + `description`(从 og 标签 / meta 抽),**这是 sitemap 没有的纯 SEO 信号**
+
+    **`/v2/scrape` 返回**(Groq 单页实采):
+    ```json
+    {
+      "success": true,
+      "data": {
+        "markdown": "# Supported Models...\n\n[![Groq](https://...)](...)\n\n[Docs](...) [Login](...)\n\n...",
+        "metadata": {
+          "title": "Supported Models - GroqDocs",
+          "og:title": "Supported Models - GroqDocs",
+          "ogSiteName": "GroqDocs",
+          "twitter:title": "Supported Models - GroqDocs",
+          "ogImage": "https://console.groq.com/og_cloudv5.jpg",
+          "viewport": "...",
+          "statusCode": 200,
+          "sourceURL": "https://console.groq.com/docs/models"
+        }
+      }
+    }
+    ```
+    单页 markdown + 全套 og/twitter/seo metadata + 原 statusCode
+
+    **`/v2/crawl` 异步 status 返回**(OpenAlex 99 页实采):
+    ```json
+    {
+      "success": true,
+      "status": "completed",          // "scraping" / "completed" / "failed" / "cancelled"
+      "completed": 99,
+      "total": 99,
+      "creditsUsed": 99,
+      "expiresAt": "2026-05-06T04:08:09.000Z",
+      "data": [
+        {
+          "markdown": "[Skip to main content](...)\n\n[OpenAlex Developers home page![light logo](https://...)]...",
+          "metadata": {
+            "og:title": "Overview - OpenAlex Developers",
+            "language": "en",
+            "ogUrl": "https://developers.openalex.org",
+            "sourceURL": "https://developers.openalex.org",
+            "statusCode": 200,
+            ...
+          }
+        },
+        ... // 99 items
+      ],
+      "next": null  // 分页:总返回 > 10MB 时这里是下一页 URL
+    }
+    ```
+    **完整状态机**:`POST /v2/crawl` 返 `{success, id, url}` kickoff → 多次 `GET <url>` polling 直到 `status === "completed"` → 一次性拿全部 markdown。**注意**:`expiresAt` 是 24h 后(crawl 结果只缓存一天)
+
+    **G. 元教训**
+    - **当一个 SaaS 工具看似独有,先做 "agent + 通用 CLI 能否复现" 的反向测试**——本次 Firecrawl `/map` vs `curl|grep` 实跑等价,直接推翻自己首版结论。这是 §2.11 / §5.1 #11 / #18 反复说的"adapter 真价值在跨源中间层,不在 per-source 代码"在工具选型上的同形应用
+    - **Vendor README 文案 + 工具能力天花板 ≠ 本项目命中率**:Firecrawl 的差异化能力(SPA / CF 绕过)真实存在,但本项目大多 vendor docs 站(deps.dev / OSV / GitHub Pages / MkDocs)都是静态的,**真正用得上 Firecrawl 杀手能力的子集 < 30%**(§5.1 #23 列的 Mintlify / SPA 类才命中)
+    - **源码层 + 实测层 + 反向 DIY 三线验证**:今天的循环就是这个——单读 README 给"两者位于不同生态位"印象;扒源码确认 Jina 无 frontier 公开端点;实跑 Firecrawl /crawl 确认能用;**反向跑 DIY** 才发现"独有"被高估。**没有第三步,就会落锚到错配置**
+    - **跑通 ≠ 写完**:今天验证 step 1-2(URL 发现 + markdown 拉取);step 3-5(LLM 抽 endpoint/schema/auth + 生成 OpenAPI + 真实请求校验)未实跑,留 §5.3 开放问题
+    - 承袭 §5.1 #14/#15/#20:产品迭代按月,Jina/Firecrawl 都活在 active dev,**至少季度复测端点 + 价格 + rate limit**
+
+    **J. 行业 cross-ref 与 strategy/pipeline 落盘 [2026-05-06]**
+
+    在 5 路径对照基础上做了行业横向调研,把 strategy + pipeline 落到 repo 根级 git tracked 文件:
+
+    - **`ground-api-strategy.md`**(repo 根) — 高层定位 + 行业拓扑 + 与 Context7 / Cursor 的精确对比 + 风险与未决
+    - **`ground-api-pipeline.md`**(repo 根) — 4 probe + 5 路径降级的可执行 bash + 严格验证 + trap 列表 + 命中率累计
+    - 实证工件继续保留 `reference/batch/`(.gitignore 排除,本地)
+
+    行业 cross-ref 关键数据(strategy.md §2 详):
+    - **llms.txt 时间线**:Jeremy Howard(Answer.AI) 2024-09 提出 → Mintlify + Anthropic 2024-11 合作开发 llms-full.txt → 2026-Q1 通用域 10% 命中(SE Ranking 30 万站) **vs LLM/dev 16 vendor panel 87%**(我们 Wave 2)。**dev tool 子集是这个标准的核心产消生态**
+    - **Anthropic ship 58MB llms-full.txt 不是巧合**:他们和 Mintlify 共同设计了 llms-full.txt 协议,自然是首批最大 producer
+    - **AI 大厂未承诺生产读 llms.txt**(Google Mueller 公开声明 / PPC.land "adoption stalls"),**但 dev IDE 工具(Cursor / Continue / Aider / Context7)在用** — 这正是 search-agent 的目标用户群,与通用 AI search 的结论无关
+    - **三种 consumer 拓扑**:IDE 内置(Cursor 14.7% ctx util,绑死 IDE)/ MCP 服务(Context7 65% acc,token 4-32× 浪费)/ skill imperative(我们,host-agnostic 0 中间层)
+    - **5 项行业最佳实践共识**全部对齐我们 PIPELINE:静态 docs 本地缓存 / dynamic > static context / vendor 官源胜二手聚合 / 降级机制必须 / probe 严格验证
+
+    元教训:**做一轮单 case 实证(Wave 1) → 单点 panel 验证泛化(Wave 2) → 行业 cross-ref 锚定坐标(本段) 三步法**。第三步成本最低(几次 web search + WebFetch)但回报最高:把"我们的实测结论"和"行业演化轨迹"拼到一起,strategy 才稳;否则容易闭门造车 anchor 在 OpenAlex 单 case 的特殊性上
+
 ### 5.2 我们一开始想错被纠正的(避免重蹈)
 
 | 早期判断 | 纠正 | 触发 |
